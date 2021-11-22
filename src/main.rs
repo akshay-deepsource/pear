@@ -1,59 +1,73 @@
 use std::{
-    env, fs,
+    env,
+    error::Error,
+    fs,
+    io::Write,
     path::{Path, PathBuf},
-    str,
+    process, str,
 };
 
-use serde_json::{from_str, Value};
+use serde_json::{from_str, Map, Value};
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref DEFS: Value = from_str(include_str!("../defs.json")).unwrap();
+}
 
 fn main() {
     _main();
 }
 
 fn _main() -> Option<()> {
-    let mut args = env::args();
-    let first = args.nth(1).unwrap();
+    let mut args: Vec<_> = env::args().collect();
+    let first = args.get(1)?;
     let components = parse(&first)?;
     let loaded = load(components.as_slice())?;
-    let fig_command = fig_command(&loaded)?;
+    let fig_command = fig_command(loaded)?;
 
-    dbg!(fig_command);
+    let res = call_fzf(first.clone(), dbg!(fig_command)).ok()?;
+
+    println!("{} {}", first, res);
 
     Some(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FigCommand {
-    cmd: String,
+    cmd: &'static str,
     options: Vec<CmdOption>,
     arguments: Vec<CmdArgument>,
-    subcommand: Option<Subcommand>,
+    subcommands: Vec<Subcommand>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CmdOption {
-    name: Vec<String>,
-    description: String,
+    name: Vec<&'static str>,
+    description: Option<&'static str>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CmdArgument {
-    name: String,
+    name: &'static str,
     optional: bool,
     variadic: bool,
     template: Vec<Template>,
+    suggestions: Vec<&'static str>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Template {
     Files,
     Folders,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Subcommand {
-    name: String,
-    description: String,
+    name: &'static str,
+    description: Option<&'static str>,
+    options: Vec<CmdOption>,
+    arguments: Vec<CmdArgument>,
 }
 
 // returns a list of components
@@ -89,68 +103,137 @@ fn parse(input: &str) -> Option<Vec<String>> {
     Some(components)
 }
 
-fn load(components: &[String]) -> Option<Value> {
+fn load(components: &[String]) -> Option<&'static Value> {
     let cmd_name = components.first()?;
-    let path = ["defs", &cmd_name]
-        .iter()
-        .collect::<PathBuf>()
-        .with_extension("json");
-    let cmd_file = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&cmd_file).ok()
+    DEFS.as_object()?.get(cmd_name)
 }
 
-fn fig_command(value: &Value) -> Option<FigCommand> {
+fn fig_command(value: &'static Value) -> Option<FigCommand> {
     let cmd = get_str(value, "name")?;
-    let arguments = get_vec(value, "args")?
+    let arguments = get_vec(value, "args")
         .iter()
+        .cloned()
+        .flatten()
         .map(|a| get_argument(a))
         .flatten()
         .collect::<Vec<_>>();
-    let options = get_vec(value, "options")?
+    let options = get_vec(value, "options")
         .iter()
+        .cloned()
+        .flatten()
         .map(|a| get_option(a))
         .flatten()
         .collect::<Vec<_>>();
+
+    let subcommands = get_vec(value, "subcommands")
+        .iter()
+        .cloned()
+        .flatten()
+        .filter_map(|a| get_subcommand(a))
+        .collect::<Vec<_>>();
+
     Some(FigCommand {
         cmd,
         options,
         arguments,
-        subcommand: None,
+        subcommands,
     })
 }
 
-fn get_option(value: &Value) -> Option<CmdOption> {
+fn call_fzf(cmd: String, def: FigCommand) -> std::io::Result<String> {
+    let options_iter = def
+        .options
+        .iter()
+        .map(|it| (it.name.clone(), it.description));
+
+    let subcommands_iter = def
+        .subcommands
+        .iter()
+        .map(|it| (vec![it.name], it.description));
+
+    let completions = options_iter.chain(subcommands_iter).collect::<Vec<_>>();
+
+    let c_str = completions
+        .iter()
+        .cloned()
+        .flat_map(|(name, desc)| name)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut proc = process::Command::new("fzf")
+        .stdin(process::Stdio::piped())
+        .stdout(process::Stdio::piped())
+        .spawn()?;
+
+    let mut stdin = proc.stdin.take().unwrap();
+
+    stdin.write(c_str.as_bytes())?;
+
+    let out = proc.wait_with_output()?;
+
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn get_option(value: &'static Value) -> Option<CmdOption> {
     let name = value
         .get("name")
         .map(|v| match v {
-            Value::String(s) => Some(vec![s.to_owned()]),
-            Value::Array(v) => Some(
-                v.iter()
-                    .map(|s| s.as_str().unwrap().to_owned())
-                    .collect::<Vec<_>>(),
-            ),
+            Value::String(s) => Some(vec![s.as_str()]),
+            Value::Array(v) => Some(v.iter().map(|s| s.as_str().unwrap()).collect::<Vec<_>>()),
             _ => None,
         })
         .flatten()?;
-    let description = get_str(value, "description")?;
+    let description = get_str(value, "description");
     Some(CmdOption { name, description })
 }
 
-fn get_argument(value: &Value) -> Option<CmdArgument> {
+fn get_argument(value: &'static Value) -> Option<CmdArgument> {
     let name = get_str(value, "name")?;
     let optional = get_bool(value, "isOptional").unwrap_or(false);
     let variadic = get_bool(value, "isVariadic").unwrap_or(false);
     let template = get_vec(value, "template")
-        .unwrap_or_default()
-        .iter()
-        .map(|v| get_template(v.as_str().unwrap()))
-        .flatten()
-        .collect::<Vec<_>>();
+        .map(|vec| {
+            vec.iter()
+                .map(|v| get_template(v.as_str().unwrap()))
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let suggestions = get_vec(value, "suggestions")
+        .map(|vec| vec.iter().map(|v| v.as_str()).flatten().collect::<Vec<_>>())
+        .unwrap_or_default();
+
     Some(CmdArgument {
         name,
         optional,
         variadic,
         template,
+        suggestions,
+    })
+}
+
+fn get_subcommand(value: &'static Value) -> Option<Subcommand> {
+    let name = get_str(value, "name")?;
+    let description = get_str(value, "description");
+    let options = get_vec(value, "options")
+        .iter()
+        .cloned()
+        .flatten()
+        .filter_map(|opt| get_option(opt))
+        .collect::<Vec<_>>();
+    let arguments = get_vec(value, "args")
+        .iter()
+        .cloned()
+        .flatten()
+        .filter_map(|arg| get_argument(arg))
+        .collect::<Vec<_>>();
+
+    Some(Subcommand {
+        name,
+        description,
+        options,
+        arguments,
     })
 }
 
@@ -162,14 +245,18 @@ fn get_template(value: &str) -> Option<Template> {
     }
 }
 
-fn get_str(value: &Value, id: &str) -> Option<String> {
-    value.get(id)?.as_str().map(|s| s.to_owned())
+fn get_str(value: &'static Value, id: &str) -> Option<&'static str> {
+    value.get(id)?.as_str()
 }
 
-fn get_bool(value: &Value, id: &str) -> Option<bool> {
+fn get_bool(value: &'static Value, id: &str) -> Option<bool> {
     value.get(id)?.as_bool()
 }
 
-fn get_vec(value: &Value, id: &str) -> Option<Vec<Value>> {
-    value.get(id)?.as_array().map(|v| v.to_owned())
+fn get_vec(value: &'static Value, id: &str) -> Option<&'static Vec<Value>> {
+    value.get(id)?.as_array()
+}
+
+fn get_map(value: &'static Value, id: &str) -> Option<&'static Map<String, Value>> {
+    value.get(id)?.as_object()
 }
