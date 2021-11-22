@@ -1,0 +1,1 @@
+{"name": "man", "description": "Format and display the on-line manual pages", "args": {"generators": {"script": "ls -1 $(man -w | sed 's#:#/man1 #g') | cut -f 1 -d . | sort | uniq"}}}
