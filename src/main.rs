@@ -40,9 +40,12 @@ struct Candidate {
 }
 
 enum ContextKind<'a> {
-    InSubcommand,
-    InArgument,
+    InSubcommand(&'a str),
+    InArgument(&'a str),
     InOption(&'a str),
+    CompleteSubcommand(&'a str),
+    CompleteOption(&'a str),
+    CompleteArgument(&'a str),
     NoContext,
 }
 
@@ -101,7 +104,7 @@ impl FigCommand {
                         .iter()
                         .any(|cmd| cmd.name == non_empty_last)
                     {
-                        return ContextKind::InSubcommand;
+                        return ContextKind::InSubcommand(non_empty_last);
                     } else if self
                         .options
                         .iter()
@@ -109,13 +112,29 @@ impl FigCommand {
                     {
                         return ContextKind::InOption(non_empty_last);
                     } else if self.arguments.iter().any(|cmd| cmd.name == non_empty_last) {
-                        return ContextKind::InArgument;
+                        return ContextKind::InArgument(non_empty_last);
                     }
                 }
                 return ContextKind::NoContext;
             }
-            // user typed some stuff, determine context from typed text
-            // TODO
+            // user typed some stuff, completions should riff off the user's text
+            else {
+                if self
+                    .subcommands
+                    .iter()
+                    .any(|cmd| cmd.name.starts_with(last))
+                {
+                    return ContextKind::CompleteSubcommand(last);
+                } else if self
+                    .options
+                    .iter()
+                    .any(|opt| opt.name.iter().any(|n| n.starts_with(last)))
+                {
+                    return ContextKind::CompleteOption(last);
+                } else if self.arguments.iter().any(|arg| arg.name.starts_with(last)) {
+                    return ContextKind::CompleteArgument(last);
+                }
+            }
         }
         return ContextKind::NoContext;
     }
@@ -123,7 +142,7 @@ impl FigCommand {
     fn completions(&self, ctx: &Context) -> Vec<Candidate> {
         let context_kind = self.context_kind(&ctx);
         match context_kind {
-            ContextKind::InArgument => {
+            ContextKind::InArgument(_) => {
                 vec![]
             }
             ContextKind::InOption(o) => {
@@ -144,6 +163,30 @@ impl FigCommand {
                     vec![]
                 }
             }
+            ContextKind::CompleteArgument(c) => self
+                .arguments
+                .iter()
+                .map(|it| it.name)
+                .filter(|s| s.starts_with(c))
+                .map(|c| Candidate {
+                    name: c.to_owned(),
+                    preview: String::new(),
+                })
+                .collect(),
+            ContextKind::CompleteOption(c) => self
+                .options
+                .iter()
+                .filter(|s| s.name.iter().any(|n| n.starts_with(c)))
+                .map(|s| Candidate {
+                    name: s
+                        .name
+                        .iter()
+                        .max_by(|a, b| a.len().cmp(&b.len()))
+                        .unwrap()
+                        .to_string(),
+                    preview: String::new(),
+                })
+                .collect(),
             // suggest everything
             _ => {
                 let options_iter = self.options.iter().map(|it| it.name.clone());
@@ -234,25 +277,6 @@ fn load(components: &[String]) -> Option<&'static Value> {
 }
 
 fn call_fzf(ctx: &Context, def: FigCommand) -> std::io::Result<String> {
-    // let options_iter = def
-    //     .options
-    //     .iter()
-    //     .map(|it| (it.name.clone(), it.description));
-
-    // let subcommands_iter = def
-    //     .subcommands
-    //     .iter()
-    //     .map(|it| (vec![it.name], it.description));
-
-    // let completions = options_iter.chain(subcommands_iter).collect::<Vec<_>>();
-
-    // let c_str = completions
-    //     .iter()
-    //     .cloned()
-    //     .flat_map(|(name, desc)| name)
-    //     .collect::<Vec<_>>()
-    //     .join("\n");
-
     let c_str = def
         .completions(&ctx)
         .iter()
@@ -261,6 +285,8 @@ fn call_fzf(ctx: &Context, def: FigCommand) -> std::io::Result<String> {
         .join("\n");
 
     let mut proc = process::Command::new("fzf")
+        .arg("--prompt")
+        .arg(ctx.ctx.join(" "))
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())
         .spawn()?;
